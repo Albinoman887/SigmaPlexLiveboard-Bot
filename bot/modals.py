@@ -1,5 +1,8 @@
-import discord
+import io
+from datetime import datetime, timezone
 from urllib.parse import urlparse
+
+import discord
 
 from bot.db import ReportDB
 from bot.utils import build_staff_embed, report_subject, try_dm
@@ -40,11 +43,10 @@ def _get_ping_ids_for_report(cfg, report_kind: str) -> list[int]:
 def _get_responses_channel_id_from_bot(interaction: discord.Interaction) -> int:
     """
     Pull RESPONSES_CHANNEL_ID from the bot config if available.
-    Keeps modals.py independent from direct os.getenv reads.
+    Keeps modals.py independent from direct env reads.
     """
     cfg = getattr(interaction.client, "cfg", None)
-    cid = int(getattr(cfg, "responses_channel_id", 0) or 0)
-    return cid
+    return int(getattr(cfg, "responses_channel_id", 0) or 0)
 
 
 async def _try_public_update(
@@ -75,6 +77,127 @@ async def _try_public_update(
         )
     except Exception:
         pass
+
+
+# ----------------------------
+# Ticket transcripts (transcripts channel + DM)
+# ----------------------------
+
+def _get_transcripts_channel_id_from_bot(interaction: discord.Interaction) -> int:
+    """
+    Pull TRANSCRIPTS_CHANNEL_ID from the bot config if available.
+    """
+    cfg = getattr(interaction.client, "cfg", None)
+    return int(getattr(cfg, "transcripts_channel_id", 0) or 0)
+
+
+def _fmt_ts(dt: datetime) -> str:
+    # simple, stable timestamp for text files
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+async def _build_channel_transcript_text(ch: discord.TextChannel, *, limit: int = 500) -> str:
+    """
+    Builds a plain-text transcript. Best effort.
+    """
+    lines: list[str] = []
+    header = [
+        f"Transcript for #{ch.name} ({ch.id})",
+        f"Guild: {ch.guild.name} ({ch.guild.id})",
+        f"Generated: {_fmt_ts(datetime.now(timezone.utc))}",
+        "-" * 72,
+        "",
+    ]
+    lines.extend(header)
+
+    try:
+        async for m in ch.history(limit=limit, oldest_first=True):
+            created = m.created_at or datetime.now(timezone.utc)
+            author = getattr(m.author, "display_name", None) or str(m.author)
+            author_id = getattr(m.author, "id", "unknown")
+            content = (m.content or "").replace("\r\n", "\n").replace("\r", "\n")
+
+            lines.append(f"[{_fmt_ts(created)}] {author} ({author_id}):")
+            if content.strip():
+                lines.append(content)
+            else:
+                lines.append("—")
+
+            # attachments
+            if m.attachments:
+                lines.append("Attachments:")
+                for a in m.attachments:
+                    try:
+                        lines.append(f"- {a.filename}: {a.url}")
+                    except Exception:
+                        lines.append("- (attachment)")
+
+            # embeds (keep it lightweight)
+            if m.embeds:
+                lines.append(f"Embeds: {len(m.embeds)}")
+
+            lines.append("")  # spacer
+    except Exception as e:
+        lines.append("")
+        lines.append(f"[Transcript generation error: {e!r}]")
+
+    return "\n".join(lines)
+
+
+async def _try_send_transcript(
+    interaction: discord.Interaction,
+    reporter: discord.abc.User | None,
+    report_id: int,
+    outcome: str,
+    ch: discord.TextChannel | None,
+) -> None:
+    """
+    Best-effort:
+      - posts transcript file to TRANSCRIPTS_CHANNEL_ID (if set)
+      - DMs the same file to the reporter (if available)
+    """
+    if not interaction.guild or not ch:
+        return
+
+    transcripts_cid = _get_transcripts_channel_id_from_bot(interaction)
+    if transcripts_cid <= 0 and reporter is None:
+        return
+
+    text = await _build_channel_transcript_text(ch)
+    filename = f"report-{int(report_id)}-{outcome.lower().replace(' ', '-')}-transcript.txt"
+
+    data = text.encode("utf-8", errors="replace")
+    file_for_channel = discord.File(io.BytesIO(data), filename=filename)
+    file_for_dm = discord.File(io.BytesIO(data), filename=filename)
+
+    # Post to transcripts channel
+    if transcripts_cid > 0:
+        tchan = interaction.guild.get_channel(int(transcripts_cid))
+        if isinstance(tchan, discord.TextChannel):
+            try:
+                await tchan.send(
+                    content=(
+                        f"Transcript — report **#{int(report_id)}** — **{outcome}**\n"
+                        f"Source channel: {ch.mention} ({ch.id})"
+                    ),
+                    file=file_for_channel,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            except Exception:
+                pass
+
+    # DM reporter
+    if reporter is not None:
+        try:
+            await reporter.send(
+                content=f"Transcript for your report **#{int(report_id)}** ({outcome}).",
+                file=file_for_dm,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception:
+            pass
 
 
 # ----------------------------
@@ -197,7 +320,7 @@ class TVReportModal(discord.ui.Modal, title="Report TV Issue"):
 
 class VODTVShowReportModal(discord.ui.Modal, title="Report TV Show Issue"):
     title_name = discord.ui.TextInput(
-        label="Show + season/episode (e.g. S02E03)",  # <= 45 chars
+        label="Show + season/episode (e.g. S02E03)",
         max_length=150,
         placeholder="Example: Family Guy S02E03",
     )
@@ -417,18 +540,21 @@ class ResolveReportModal(discord.ui.Modal):
         self.delete_current_channel = bool(delete_current_channel)
         self.close_ticket_channel = bool(close_ticket_channel)
 
-    async def _close_ticket_channel_if_any(self, guild: discord.Guild):
+    async def _close_ticket_channel_if_any(self, interaction: discord.Interaction, reporter: discord.abc.User | None):
         ticket_id = None
         try:
             ticket_id = self.db.get_ticket_channel_id(self.report_id)
         except Exception:
             ticket_id = None
 
-        if not ticket_id:
+        if not ticket_id or not interaction.guild:
             return
 
-        ch = guild.get_channel(int(ticket_id))
+        ch = interaction.guild.get_channel(int(ticket_id))
         if isinstance(ch, discord.TextChannel):
+            # transcript first
+            await _try_send_transcript(interaction, reporter, self.report_id, "Resolved", ch)
+
             try:
                 await ch.delete(reason=f"Report #{self.report_id} resolved")
             except discord.Forbidden:
@@ -455,8 +581,15 @@ class ResolveReportModal(discord.ui.Modal):
         resolver_id = int(interaction.user.id)
         note = str(self.details).strip()
 
+        # Pre-fetch reporter for transcripts + DMs
+        reporter_u: discord.abc.User | None = None
+        try:
+            reporter_u = await interaction.client.fetch_user(int(report["reporter_id"]))
+        except Exception:
+            reporter_u = None
+
         if self.close_ticket_channel:
-            await self._close_ticket_channel_if_any(interaction.guild)
+            await self._close_ticket_channel_if_any(interaction, reporter_u)
 
         if hasattr(self.db, "mark_resolved"):
             try:
@@ -474,16 +607,14 @@ class ResolveReportModal(discord.ui.Modal):
                 if isinstance(staff_channel, discord.TextChannel):
                     staff_msg = await staff_channel.fetch_message(int(report["staff_message_id"]))
 
-                    reporter_u = await interaction.client.fetch_user(int(report["reporter_id"]))
                     source = interaction.guild.get_channel(int(report["source_channel_id"])) or staff_channel
-
                     claimed_by = report.get("claimed_by_user_id")
                     claimed_at = report.get("claimed_at")
 
                     embed = build_staff_embed(
                         self.report_id,
                         report["report_type"],
-                        reporter_u,
+                        reporter_u or interaction.user,
                         source,
                         report["payload"],
                         "Resolved",
@@ -507,15 +638,15 @@ class ResolveReportModal(discord.ui.Modal):
             except Exception:
                 pass
 
-        reporter = None
+        reporter = reporter_u
         msg = None
         try:
-            reporter = await interaction.client.fetch_user(int(report["reporter_id"]))
-            subj = report_subject(report["report_type"], report["payload"])
-            msg = f"✅ Update on your report #{self.report_id} ({subj}): **Resolved**."
-            if note:
-                msg += f"\n\nDetails: {note}"
-            await try_dm(reporter, msg)
+            if reporter:
+                subj = report_subject(report["report_type"], report["payload"])
+                msg = f"✅ Update on your report #{self.report_id} ({subj}): **Resolved**."
+                if note:
+                    msg += f"\n\nDetails: {note}"
+                await try_dm(reporter, msg)
         except Exception:
             pass
 
@@ -530,7 +661,11 @@ class ResolveReportModal(discord.ui.Modal):
 
         await interaction.response.send_message("✅ Resolved.", ephemeral=True)
 
-        if self.delete_current_channel and interaction.channel:
+        # If this modal is being used inside the ticket channel, transcript + delete it
+        if self.delete_current_channel and interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+            # transcript first
+            await _try_send_transcript(interaction, reporter, self.report_id, "Resolved", interaction.channel)
+
             try:
                 await interaction.channel.delete(reason=f"Resolved ticket for report #{self.report_id}")
             except discord.Forbidden:
@@ -543,16 +678,16 @@ class ResolveReportModal(discord.ui.Modal):
 
 
 # ----------------------------
-# Not Resolved modal (NEW)
+# Not Resolved modal
 # ----------------------------
 
 class NotResolvedReportModal(discord.ui.Modal):
     details = discord.ui.TextInput(
         label="Why isn’t this resolved?",
         style=discord.TextStyle.paragraph,
-        required=True,  # ✅ required
+        required=True,
         max_length=1000,
-        placeholder="Explain what was tried and what’s still failing (required)",
+        placeholder="Example: couldn’t replicate the issue, no errors found, needs more info (required)",
     )
 
     def __init__(
@@ -567,7 +702,6 @@ class NotResolvedReportModal(discord.ui.Modal):
         delete_current_channel: bool = False,
         close_ticket_channel: bool = False,
     ):
-        # Keep title short (Discord enforces limits here too)
         super().__init__(title=f"Not Resolved #{int(report_id)}")
         self.db = db
         self.staff_channel_id = int(staff_channel_id or 0)
@@ -578,18 +712,21 @@ class NotResolvedReportModal(discord.ui.Modal):
         self.delete_current_channel = bool(delete_current_channel)
         self.close_ticket_channel = bool(close_ticket_channel)
 
-    async def _close_ticket_channel_if_any(self, guild: discord.Guild):
+    async def _close_ticket_channel_if_any(self, interaction: discord.Interaction, reporter: discord.abc.User | None):
         ticket_id = None
         try:
             ticket_id = self.db.get_ticket_channel_id(self.report_id)
         except Exception:
             ticket_id = None
 
-        if not ticket_id:
+        if not ticket_id or not interaction.guild:
             return
 
-        ch = guild.get_channel(int(ticket_id))
+        ch = interaction.guild.get_channel(int(ticket_id))
         if isinstance(ch, discord.TextChannel):
+            # transcript first
+            await _try_send_transcript(interaction, reporter, self.report_id, "Not Resolved", ch)
+
             try:
                 await ch.delete(reason=f"Report #{self.report_id} closed as not resolved")
             except discord.Forbidden:
@@ -616,34 +753,35 @@ class NotResolvedReportModal(discord.ui.Modal):
         resolver_id = int(interaction.user.id)
         note = str(self.details).strip()
         if not note:
-            # Shouldn't happen because required=True, but keep it safe.
             return await interaction.response.send_message("❌ Details are required.", ephemeral=True)
 
+        # Pre-fetch reporter for transcripts + DMs
+        reporter_u: discord.abc.User | None = None
+        try:
+            reporter_u = await interaction.client.fetch_user(int(report["reporter_id"]))
+        except Exception:
+            reporter_u = None
+
         if self.close_ticket_channel:
-            await self._close_ticket_channel_if_any(interaction.guild)
+            await self._close_ticket_channel_if_any(interaction, reporter_u)
 
-        # No mark_resolved call here — this is a different outcome
         self.db.update_status(self.report_id, "Not Resolved")
-
         report = self.db.get_report_by_id(self.report_id) or report
 
-        # Update staff embed + disable buttons
         if self.staff_channel_id and report.get("staff_message_id"):
             try:
                 staff_channel = interaction.guild.get_channel(self.staff_channel_id)
                 if isinstance(staff_channel, discord.TextChannel):
                     staff_msg = await staff_channel.fetch_message(int(report["staff_message_id"]))
 
-                    reporter_u = await interaction.client.fetch_user(int(report["reporter_id"]))
                     source = interaction.guild.get_channel(int(report["source_channel_id"])) or staff_channel
-
                     claimed_by = report.get("claimed_by_user_id")
                     claimed_at = report.get("claimed_at")
 
                     embed = build_staff_embed(
                         self.report_id,
                         report["report_type"],
-                        reporter_u,
+                        reporter_u or interaction.user,
                         source,
                         report["payload"],
                         "Not Resolved",
@@ -651,7 +789,7 @@ class NotResolvedReportModal(discord.ui.Modal):
                         claimed_by_user_id=claimed_by,
                         claimed_at=claimed_at,
                         resolved_by_id=resolver_id,
-                        resolved_note=note,  # reuse existing field in embed builder
+                        resolved_note=note,
                     )
 
                     view = ReportActionView(
@@ -667,14 +805,13 @@ class NotResolvedReportModal(discord.ui.Modal):
             except Exception:
                 pass
 
-        # DM + public update
-        reporter = None
+        reporter = reporter_u
         msg = None
         try:
-            reporter = await interaction.client.fetch_user(int(report["reporter_id"]))
-            subj = report_subject(report["report_type"], report["payload"])
-            msg = f"⚠️ Update on your report #{self.report_id} ({subj}): **Not resolved**.\n\nDetails: {note}"
-            await try_dm(reporter, msg)
+            if reporter:
+                subj = report_subject(report["report_type"], report["payload"])
+                msg = f"⚠️ Update on your report #{self.report_id} ({subj}): **Not resolved**.\n\nDetails: {note}"
+                await try_dm(reporter, msg)
         except Exception:
             pass
 
@@ -689,7 +826,10 @@ class NotResolvedReportModal(discord.ui.Modal):
 
         await interaction.response.send_message("✅ Closed as not resolved.", ephemeral=True)
 
-        if self.delete_current_channel and interaction.channel:
+        if self.delete_current_channel and interaction.channel and isinstance(interaction.channel, discord.TextChannel):
+            # transcript first
+            await _try_send_transcript(interaction, reporter, self.report_id, "Not Resolved", interaction.channel)
+
             try:
                 await interaction.channel.delete(reason=f"Closed (not resolved) ticket for report #{self.report_id}")
             except discord.Forbidden:

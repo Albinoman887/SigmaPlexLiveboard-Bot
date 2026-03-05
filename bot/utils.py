@@ -102,7 +102,9 @@ def build_staff_embed(
     title = f"Report #{report_id} — {rt} — {subject}"
     embed = discord.Embed(title=title)
 
-    status_txt = str(status or "Open")
+    status_txt = str(status or "Open").strip()
+    status_low = status_txt.lower()
+
     embed.add_field(name="Status", value=status_txt, inline=False)
 
     # Claim info
@@ -113,13 +115,14 @@ def build_staff_embed(
             claim_line += f" • {ts}"
         embed.add_field(name="Claimed by", value=claim_line, inline=False)
 
-    # Resolver info
-    if status_txt.strip().lower() == "resolved" and resolved_by_id:
-        embed.add_field(name="Resolved by", value=f"<@{int(resolved_by_id)}>", inline=False)
+    # Outcome info (Resolved / Not Resolved)
+    if status_low in ("resolved", "not resolved") and resolved_by_id:
+        field_name = "Resolved by" if status_low == "resolved" else "Closed by"
+        embed.add_field(name=field_name, value=f"<@{int(resolved_by_id)}>", inline=False)
 
-    # Resolution details
-    if status_txt.strip().lower() == "resolved" and resolved_note:
-        embed.add_field(name="Resolution details", value=str(resolved_note)[:1024], inline=False)
+    if status_low in ("resolved", "not resolved") and resolved_note:
+        field_name = "Resolution details" if status_low == "resolved" else "Closure details"
+        embed.add_field(name=field_name, value=str(resolved_note)[:1024], inline=False)
 
     embed.add_field(name="Reporter", value=_as_user_label(reporter), inline=False)
     embed.add_field(name="Reported from", value=_safe_channel_name(source_channel), inline=False)
@@ -147,11 +150,10 @@ def build_staff_embed(
 
         embed.add_field(name="Issue", value=str(issue), inline=False)
 
-    # Ticket link
-    if ticket_channel_id and status_txt.strip().lower() not in ("resolved", "not resolved"):
+    # Ticket link (hide once closed)
+    if ticket_channel_id and status_low not in ("resolved", "not resolved"):
         embed.add_field(name="Ticket", value=f"<#{int(ticket_channel_id)}>", inline=False)
 
-    # Updated staff actions text
     embed.add_field(
         name="Staff actions",
         value=(
