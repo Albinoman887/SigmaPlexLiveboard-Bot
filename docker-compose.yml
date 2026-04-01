@@ -1,5 +1,5 @@
 services:
-  reports-bot:
+  plex-liveboard-bot:
     build: .
     restart: unless-stopped
     env_file:
