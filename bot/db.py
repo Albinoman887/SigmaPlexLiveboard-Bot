@@ -1,20 +1,10 @@
-import json
 import sqlite3
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Iterable
+from datetime import datetime, timezone
+from typing import Optional
 
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _try_parse_iso(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(s)
-    except Exception:
-        return None
 
 
 class ReportDB:
@@ -22,80 +12,10 @@ class ReportDB:
         self.path = path
         self.conn = sqlite3.connect(self.path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-
-        self._payload_col = "payload_json"
-        self._created_at_col = "created_at"
-
         self._ensure_schema()
-        self._detect_reports_columns()
-
-    # ---------------- Schema helpers ----------------
-
-    def _table_columns(self, table: str) -> list[str]:
-        cur = self.conn.cursor()
-        cur.execute(f"PRAGMA table_info({table})")
-        return [r[1] for r in cur.fetchall()]
-
-    def _ensure_column(self, table: str, col: str, decl: str) -> None:
-        cols = self._table_columns(table)
-        if col not in cols:
-            cur = self.conn.cursor()
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
-            self.conn.commit()
 
     def _ensure_schema(self) -> None:
         cur = self.conn.cursor()
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reports (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                report_type TEXT NOT NULL,
-                reporter_id INTEGER NOT NULL,
-                guild_id INTEGER NOT NULL,
-                source_channel_id INTEGER NOT NULL,
-                staff_message_id INTEGER,
-                status TEXT NOT NULL DEFAULT 'Open',
-                payload_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_blocks (
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                is_permanent INTEGER NOT NULL DEFAULT 0,
-                expires_at TEXT,
-                reason TEXT,
-                blocked_by INTEGER,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (guild_id, user_id)
-            )
-            """
-        )
-
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS liveboards (
-                guild_id INTEGER PRIMARY KEY,
-                channel_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL
-            )
-            """
-        )
 
         cur.execute(
             """
@@ -468,7 +388,7 @@ class ReportDB:
         )
         self.conn.commit()
 
-    def get_plex_liveboard(self, guild_id: int):
+    def get_plex_liveboard(self, guild_id: int) -> Optional[dict]:
         cur = self.conn.cursor()
         cur.execute(
             "SELECT guild_id, channel_id, message_id FROM plex_liveboards WHERE guild_id=?",
@@ -492,15 +412,13 @@ class ReportDB:
             for r in rows
         ]
 
-    def clear_plex_liveboard(self, guild_id: int):
+    def clear_plex_liveboard(self, guild_id: int) -> None:
         cur = self.conn.cursor()
         cur.execute("DELETE FROM plex_liveboards WHERE guild_id=?", (int(guild_id),))
         self.conn.commit()
 
-    # ---------------- Plex statuses ----------------
-
-    def set_plex_status(self, guild_id: int, server_name: str, status: str, updated_at: Optional[str] = None):
-        now = updated_at or _utcnow_iso()
+    def set_plex_status(self, guild_id: int, server_name: str, status: str, updated_at: Optional[str] = None) -> None:
+        timestamp = updated_at or _utcnow_iso()
         cur = self.conn.cursor()
         cur.execute(
             """
@@ -510,7 +428,7 @@ class ReportDB:
             DO UPDATE SET status=excluded.status,
                           updated_at=excluded.updated_at
             """,
-            (int(guild_id), str(server_name).upper(), str(status), now),
+            (int(guild_id), str(server_name).upper(), str(status), timestamp),
         )
         self.conn.commit()
 
@@ -584,12 +502,13 @@ class ReportDB:
             (int(guild_id),),
         )
         rows = cur.fetchall()
-        out: dict[str, str] = {}
-        for r in rows:
-            out[str(r["server_name"]).upper()] = str(r["status"])
-        return out
+        return {
+            str(r["server_name"]).upper(): str(r["status"])
+            for r in rows
+            if r["server_name"] is not None and r["status"] is not None
+        }
 
-    def clear_plex_statuses(self, guild_id: int):
+    def clear_plex_statuses(self, guild_id: int) -> None:
         cur = self.conn.cursor()
         cur.execute("DELETE FROM plex_statuses WHERE guild_id=?", (int(guild_id),))
         self.conn.commit()
