@@ -109,7 +109,7 @@ class PlexLiveboardCog(commands.Cog):
             description=(
                 "This board updates automatically from Plex webhook logs.\n"
                 "Only Plex server up/down notifications affect this board.\n\n"
-                f"Last update: {_ts(_utcnow())}"
+                f"Last refreshed: {_ts(_utcnow())}"
             ),
         )
 
