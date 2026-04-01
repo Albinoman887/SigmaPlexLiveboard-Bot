@@ -124,7 +124,6 @@ class PlexLiveboardCog(commands.Cog):
         embed.add_field(name="Alpha", value=fmt(statuses.get("ALPHA", "Unknown")), inline=True)
         embed.add_field(name="Delta", value=fmt(statuses.get("DELTA", "Unknown")), inline=True)
 
-        embed.set_footer(text="Omega also accepts SS East as an alias.")
         return embed
 
     async def get_current_statuses(self, guild_id: int) -> dict[str, str]:
