@@ -1,68 +1,43 @@
-# Discord Reports Bot
+# Plex Liveboard Bot
 
-A Discord bot for handling TV and VOD issue reports using slash commands, modals, and staff workflows.
+This project now contains only the Plex liveboard feature.
 
 ## Features
-- `/report-tv` and `/report-vod` slash commands
-- Modal-based report submission
-- Staff review buttons:
-  - Fixed
-  - Can't replicate
-  - More info required
-  - Send follow-up
-- Public + DM updates to reporters
-- Configurable staff pings with on/off toggle
-- Multi-channel support for reporting and testing
-- Dockerized deployment
-- SQLite persistence
-- **Dynamic “Watching” bot status (IPTV + TMDB)**
+- Monitors Plex webhook log messages in the configured logs channel
+- Tracks server state for Omega, Alpha, and Delta
+- Posts and refreshes a liveboard embed in a chosen channel
+- Stores liveboard config and statuses in SQLite
 
-## Bot Presence (Watching Status)
+## Slash Commands
+- `/plexliveboardstart`
+- `/plexliveboardrefresh`
+- `/plexliveboardstop`
+- `/plexset`
+- `/plexstatus`
+- `/plexclear`
 
-The bot displays a rotating **“Watching …”** status themed around IPTV, live TV, and popular shows/movies.
-
-### How it works
-- Status updates every **5 minutes**
-- Titles are chosen from:
-  - Local IPTV / TV channel names
-  - IPTV-themed phrases
-  - Trending TV shows and movies from **TMDB**
-- TMDB titles are refreshed every **6 hours**
-- If the TMDB token is missing or unavailable, the bot safely falls back to local lists only
-
-### Example statuses
-- Watching BBC One
-- Watching Sky Sports News
-- Watching Breaking Bad
-- Watching Interstellar
-- Watching IPTV playlists
-
-### TMDB configuration
-To enable TMDB-powered titles, add this to your `.env`:
-
-TMDB_BEARER_TOKEN=your_tmdb_read_access_token
-
-This should be the **TMDB API Read Access Token (v4)**.
+All commands are staff-only and require `STAFF_ROLE_ID`.
 
 ## Setup
 
-### 1. Clone the repo
-```bash 
-git clone https://github.com/yourname/discord-reports-bot.git
-cd discord-reports-bot
-```
-
-### 2. Create environment file
-```bash 
+### 1. Create environment file
+```bash
 cp .env.example .env
 ```
-Fill in your values (Discord token, channel IDs, optional TMDB token).
+
+### 2. Set required values in `.env`
+- `DISCORD_TOKEN`
+- `STAFF_ROLE_ID`
+
+Optional values:
+- `DB_PATH` (defaults to `./data/plex_liveboard.sqlite3`)
+- `GUILD_ID` (set for faster per-guild command sync during development)
 
 ### 3. Run with Docker
-```bash 
+```bash
 docker compose up -d --build
 ```
+
 ## Notes
-- Do **not** commit your `.env`
+- Do not commit your `.env` file
 - Runtime data is stored in `./data` via Docker volume
-- TMDB integration is optional and non-blocking
