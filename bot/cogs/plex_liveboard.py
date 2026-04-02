@@ -110,6 +110,8 @@ def _parse_state_from_message(content: str) -> str | None:
         return "Down"
     if "the plex media server is up" in text:
         return "Up"
+    if "the plex media server is back up" in text:
+        return "Up"
     return None
 
 
